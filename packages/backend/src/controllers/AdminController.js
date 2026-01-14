@@ -1,0 +1,751 @@
+const { query } = require('../config/database');
+const logger = require('../config/logger');
+const CryptoWalletService = require('../services/CryptoWalletService');
+const InviteCode = require('../models/InviteCode');
+const Joi = require('joi');
+
+class AdminController {
+  /**
+   * Get all users with their wallet balances
+   */
+  static async getAllUsers(req, res) {
+    try {
+      const result = await query(`
+        SELECT
+          u.id,
+          u.email,
+          u.phone,
+          u.first_name,
+          u.last_name,
+          u.email_verified,
+          u.phone_verified,
+          u.two_fa_enabled,
+          u.is_active,
+          u.is_admin,
+          u.provider,
+          u.created_at,
+          COALESCE(
+            json_agg(
+              json_build_object(
+                'currency', w.currency,
+                'balance', w.balance,
+                'locked_balance', w.locked_balance
+              )
+            ) FILTER (WHERE w.id IS NOT NULL),
+            '[]'
+          ) as wallets
+        FROM users u
+        LEFT JOIN wallets w ON u.id = w.user_id
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
+      `);
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_VIEW_ALL_USERS', {
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        userCount: result.rows.length
+      });
+
+      res.json({
+        success: true,
+        users: result.rows,
+        total: result.rows.length
+      });
+    } catch (error) {
+      logger.error('Admin get all users error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch users'
+      });
+    }
+  }
+
+  /**
+   * Get detailed user information including deposit addresses
+   */
+  static async getUserDetails(req, res) {
+    try {
+      const { userId } = req.params;
+
+      // Get user basic info
+      const userResult = await query(`
+        SELECT
+          id, email, phone, first_name, last_name,
+          email_verified, phone_verified, two_fa_enabled,
+          is_active, is_admin, provider, created_at
+        FROM users
+        WHERE id = $1
+      `, [userId]);
+
+      if (userResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found'
+        });
+      }
+
+      const user = userResult.rows[0];
+
+      // Get wallets with balances
+      const walletsResult = await query(`
+        SELECT currency, balance, locked_balance, created_at
+        FROM wallets
+        WHERE user_id = $1
+      `, [userId]);
+
+      // Get deposit addresses
+      const addressesResult = await query(`
+        SELECT currency, address, derivation_path, created_at
+        FROM deposit_addresses
+        WHERE user_id = $1
+      `, [userId]);
+
+      // Get recent transactions
+      const transactionsResult = await query(`
+        SELECT
+          type, currency, amount, fee, status,
+          tx_hash, created_at, completed_at
+        FROM transactions
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50
+      `, [userId]);
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_VIEW_USER_DETAILS', {
+        targetUserId: userId,
+        targetUserEmail: user.email,
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.json({
+        success: true,
+        user: {
+          ...user,
+          wallets: walletsResult.rows,
+          deposit_addresses: addressesResult.rows,
+          recent_transactions: transactionsResult.rows
+        }
+      });
+    } catch (error) {
+      logger.error('Admin get user details error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch user details'
+      });
+    }
+  }
+
+  /**
+   * Get private keys for a user's deposit addresses
+   * CRITICAL: This should only be used in emergency situations
+   */
+  static async getUserPrivateKeys(req, res) {
+    try {
+      const { userId } = req.params;
+
+      // Get user info
+      const userResult = await query(`
+        SELECT id, email, first_name, last_name
+        FROM users
+        WHERE id = $1
+      `, [userId]);
+
+      if (userResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found'
+        });
+      }
+
+      const user = userResult.rows[0];
+
+      // Get deposit addresses
+      const addressesResult = await query(`
+        SELECT currency, address, derivation_path
+        FROM deposit_addresses
+        WHERE user_id = $1
+      `, [userId]);
+
+      if (addressesResult.rows.length === 0) {
+        return res.json({
+          success: true,
+          message: 'No deposit addresses found for this user',
+          private_keys: []
+        });
+      }
+
+      // Retrieve private keys for each address
+      const privateKeys = [];
+      for (const addr of addressesResult.rows) {
+        try {
+          const keyData = CryptoWalletService.getPrivateKey(addr.derivation_path);
+          privateKeys.push({
+            currency: addr.currency,
+            address: addr.address,
+            derivation_path: addr.derivation_path,
+            private_key: keyData.privateKey,
+            private_key_hex: keyData.privateKeyHex || keyData.privateKey,
+            public_key: keyData.publicKey,
+            format: keyData.format,
+            verified_address: keyData.address // Cross-check with stored address
+          });
+        } catch (err) {
+          logger.error('Failed to retrieve private key:', {
+            userId,
+            currency: addr.currency,
+            error: err.message
+          });
+          // Add error entry instead of skipping
+          privateKeys.push({
+            currency: addr.currency,
+            address: addr.address,
+            derivation_path: addr.derivation_path,
+            error: err.message
+          });
+        }
+      }
+
+      // CRITICAL SECURITY LOG
+      logger.logSecurityEvent('ADMIN_PRIVATE_KEY_ACCESS', {
+        adminId: req.user.id,
+        adminEmail: req.user.email,
+        targetUserId: userId,
+        targetUserEmail: user.email,
+        addressCount: privateKeys.length,
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        WARNING: 'CRITICAL: Private keys were accessed by admin'
+      });
+
+      // Also log to audit logs table
+      await query(`
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, ip_address, user_agent, details)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [
+        req.user.id,
+        'PRIVATE_KEY_ACCESS',
+        'user_wallet',
+        userId,
+        req.ip,
+        req.get('User-Agent'),
+        JSON.stringify({
+          targetUserEmail: user.email,
+          addressCount: privateKeys.length,
+          severity: 'CRITICAL'
+        })
+      ]);
+
+      res.json({
+        success: true,
+        warning: 'CRITICAL: These private keys provide full access to user funds. Handle with extreme care.',
+        user: {
+          id: user.id,
+          email: user.email,
+          name: `${user.first_name || ''} ${user.last_name || ''}`.trim()
+        },
+        private_keys: privateKeys
+      });
+    } catch (error) {
+      logger.error('Admin get private keys error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to retrieve private keys'
+      });
+    }
+  }
+
+  /**
+   * Get platform statistics
+   */
+  static async getPlatformStats(req, res) {
+    try {
+      // Get user statistics
+      const userStatsResult = await query(`
+        SELECT
+          COUNT(*) as total_users,
+          COUNT(*) FILTER (WHERE email_verified = true) as verified_users,
+          COUNT(*) FILTER (WHERE is_active = true) as active_users,
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as new_users_30d,
+          COUNT(*) FILTER (WHERE is_admin = true) as admin_users
+        FROM users
+      `);
+
+      // Get wallet statistics
+      const walletStatsResult = await query(`
+        SELECT
+          currency,
+          COUNT(*) as wallet_count,
+          SUM(balance) as total_balance,
+          SUM(locked_balance) as total_locked
+        FROM wallets
+        GROUP BY currency
+      `);
+
+      // Get transaction statistics
+      const txStatsResult = await query(`
+        SELECT
+          type,
+          COUNT(*) as count,
+          SUM(amount) as total_amount
+        FROM transactions
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY type
+      `);
+
+      // Get order statistics
+      const orderStatsResult = await query(`
+        SELECT
+          status,
+          COUNT(*) as count
+        FROM orders
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY status
+      `);
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_VIEW_PLATFORM_STATS', {
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.json({
+        success: true,
+        stats: {
+          users: userStatsResult.rows[0],
+          wallets: walletStatsResult.rows,
+          transactions_30d: txStatsResult.rows,
+          orders_30d: orderStatsResult.rows
+        }
+      });
+    } catch (error) {
+      logger.error('Admin get platform stats error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch platform statistics'
+      });
+    }
+  }
+
+  /**
+   * Get audit logs
+   */
+  static async getAuditLogs(req, res) {
+    try {
+      const { limit = 100, offset = 0, userId, action } = req.query;
+
+      let queryText = `
+        SELECT
+          al.*,
+          u.email as user_email
+        FROM audit_logs al
+        LEFT JOIN users u ON al.user_id = u.id
+        WHERE 1=1
+      `;
+
+      const params = [];
+      let paramCount = 1;
+
+      if (userId) {
+        queryText += ` AND al.user_id = $${paramCount}`;
+        params.push(userId);
+        paramCount++;
+      }
+
+      if (action) {
+        queryText += ` AND al.action = $${paramCount}`;
+        params.push(action);
+        paramCount++;
+      }
+
+      queryText += ` ORDER BY al.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+      params.push(parseInt(limit), parseInt(offset));
+
+      const result = await query(queryText, params);
+
+      // Get total count
+      let countQuery = 'SELECT COUNT(*) FROM audit_logs WHERE 1=1';
+      const countParams = [];
+      if (userId) {
+        countQuery += ' AND user_id = $1';
+        countParams.push(userId);
+      }
+      if (action && userId) {
+        countQuery += ' AND action = $2';
+        countParams.push(action);
+      } else if (action) {
+        countQuery += ' AND action = $1';
+        countParams.push(action);
+      }
+
+      const countResult = await query(countQuery, countParams);
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_VIEW_AUDIT_LOGS', {
+        ipAddress: req.ip,
+        filters: { userId, action, limit, offset }
+      });
+
+      res.json({
+        success: true,
+        logs: result.rows,
+        total: parseInt(countResult.rows[0].count),
+        limit: parseInt(limit),
+        offset: parseInt(offset)
+      });
+    } catch (error) {
+      logger.error('Admin get audit logs error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch audit logs'
+      });
+    }
+  }
+
+  /**
+   * Generate invite codes
+   * POST /api/admin/invite-codes/generate
+   */
+  static async generateInviteCodes(req, res) {
+    try {
+      // Validate request
+      const schema = Joi.object({
+        count: Joi.number().integer().min(1).max(100).default(1),
+        notes: Joi.string().max(500).optional(),
+        expiresAt: Joi.date().optional(),
+        maxUses: Joi.number().integer().min(1).max(1000).default(1)
+      });
+
+      const { error, value } = schema.validate(req.body);
+      if (error) {
+        return res.status(400).json({
+          success: false,
+          error: error.details[0].message
+        });
+      }
+
+      const { count, notes, expiresAt, maxUses } = value;
+
+      // Generate codes
+      const codes = [];
+      for (let i = 0; i < count; i++) {
+        const inviteCode = await InviteCode.generate({
+          createdBy: req.user.id,
+          expiresAt: expiresAt || null,
+          maxUses,
+          notes: notes || `Generated by admin ${req.user.email}`
+        });
+        codes.push(inviteCode);
+      }
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_GENERATE_INVITE_CODES', {
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        count,
+        codes: codes.map(c => c.code)
+      });
+
+      res.json({
+        success: true,
+        message: `Successfully generated ${codes.length} invite code(s)`,
+        codes: codes.map(c => ({
+          code: c.code,
+          expiresAt: c.expires_at,
+          maxUses: c.max_uses,
+          createdAt: c.created_at
+        }))
+      });
+    } catch (error) {
+      logger.error('Admin generate invite codes error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to generate invite codes'
+      });
+    }
+  }
+
+  /**
+   * Get all invite codes
+   * GET /api/admin/invite-codes
+   */
+  static async getAllInviteCodes(req, res) {
+    try {
+      const { limit = 100, offset = 0 } = req.query;
+
+      const codes = await InviteCode.getAll(parseInt(limit), parseInt(offset));
+      const stats = await InviteCode.getStats();
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_VIEW_INVITE_CODES', {
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.json({
+        success: true,
+        codes,
+        stats,
+        limit: parseInt(limit),
+        offset: parseInt(offset)
+      });
+    } catch (error) {
+      logger.error('Admin get invite codes error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch invite codes'
+      });
+    }
+  }
+
+  /**
+   * Deactivate an invite code
+   * POST /api/admin/invite-codes/:code/deactivate
+   */
+  static async deactivateInviteCode(req, res) {
+    try {
+      const { code } = req.params;
+
+      const inviteCode = await InviteCode.deactivate(code);
+
+      if (!inviteCode) {
+        return res.status(404).json({
+          success: false,
+          error: 'Invite code not found'
+        });
+      }
+
+      // Log admin action
+      logger.logUserAction(req.user.id, 'ADMIN_DEACTIVATE_INVITE_CODE', {
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        code
+      });
+
+      res.json({
+        success: true,
+        message: 'Invite code deactivated successfully',
+        code: inviteCode
+      });
+    } catch (error) {
+      logger.error('Admin deactivate invite code error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to deactivate invite code'
+      });
+    }
+  }
+
+  /**
+   * Delete user and all associated data
+   * DELETE /api/admin/users/:userId
+   *
+   * CRITICAL: This permanently deletes:
+   * - User account
+   * - All wallets and balances
+   * - All transactions
+   * - All deposit addresses
+   * - All orders and trades
+   * - All UTXOs
+   * - All sessions
+   * - All verification codes
+   * - All API keys
+   * - All audit logs
+   */
+  static async deleteUser(req, res) {
+    try {
+      const { userId } = req.params;
+      const { confirmation } = req.body;
+
+      // Get user info before deletion
+      const userResult = await query(`
+        SELECT id, email, first_name, last_name, is_admin
+        FROM users
+        WHERE id = $1
+      `, [userId]);
+
+      if (userResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found'
+        });
+      }
+
+      const userToDelete = userResult.rows[0];
+
+      // Prevent deletion of admin users unless explicitly confirmed
+      if (userToDelete.is_admin && confirmation !== userToDelete.email) {
+        return res.status(403).json({
+          success: false,
+          error: 'Cannot delete admin user. Please provide email as confirmation.',
+          requiresConfirmation: true
+        });
+      }
+
+      // Prevent admin from deleting themselves
+      if (userId === req.user.id) {
+        return res.status(403).json({
+          success: false,
+          error: 'You cannot delete your own account'
+        });
+      }
+
+      // CRITICAL SECURITY LOG - Before deletion
+      logger.logSecurityEvent('ADMIN_USER_DELETION_INITIATED', {
+        adminId: req.user.id,
+        adminEmail: req.user.email,
+        targetUserId: userId,
+        targetUserEmail: userToDelete.email,
+        targetUserIsAdmin: userToDelete.is_admin,
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        WARNING: 'CRITICAL: User deletion initiated'
+      });
+
+      // Get user data summary before deletion for logging
+      const walletsSummary = await query(`
+        SELECT currency, balance, locked_balance
+        FROM wallets
+        WHERE user_id = $1
+      `, [userId]);
+
+      const transactionCount = await query(`
+        SELECT COUNT(*) as count FROM transactions WHERE user_id = $1
+      `, [userId]);
+
+      const orderCount = await query(`
+        SELECT COUNT(*) as count FROM orders WHERE user_id = $1
+      `, [userId]);
+
+      // Delete user (CASCADE will handle related data)
+      // The foreign keys are set with ON DELETE CASCADE, so all related data will be deleted automatically
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+
+      // CRITICAL SECURITY LOG - After deletion
+      logger.logSecurityEvent('ADMIN_USER_DELETED', {
+        adminId: req.user.id,
+        adminEmail: req.user.email,
+        deletedUserId: userId,
+        deletedUserEmail: userToDelete.email,
+        deletedUserIsAdmin: userToDelete.is_admin,
+        walletsSummary: walletsSummary.rows,
+        transactionCount: transactionCount.rows[0].count,
+        orderCount: orderCount.rows[0].count,
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp: new Date().toISOString(),
+        WARNING: 'CRITICAL: User and all associated data permanently deleted'
+      });
+
+      // Also log to audit logs if the table still exists (though it will be deleted)
+      try {
+        await query(`
+          INSERT INTO audit_logs (user_id, action, resource_type, resource_id, ip_address, user_agent, details)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [
+          req.user.id,
+          'USER_DELETION',
+          'user',
+          userId,
+          req.ip,
+          req.get('User-Agent'),
+          JSON.stringify({
+            deletedUserEmail: userToDelete.email,
+            deletedUserIsAdmin: userToDelete.is_admin,
+            walletCount: walletsSummary.rows.length,
+            transactionCount: transactionCount.rows[0].count,
+            orderCount: orderCount.rows[0].count,
+            severity: 'CRITICAL'
+          })
+        ]);
+      } catch (auditError) {
+        // Ignore audit log errors as user might already be deleted
+        logger.error('Failed to log user deletion to audit_logs:', auditError);
+      }
+
+      res.json({
+        success: true,
+        message: 'User and all associated data deleted successfully',
+        deletedUser: {
+          id: userId,
+          email: userToDelete.email,
+          name: `${userToDelete.first_name || ''} ${userToDelete.last_name || ''}`.trim()
+        },
+        deletedData: {
+          wallets: walletsSummary.rows.length,
+          transactions: transactionCount.rows[0].count,
+          orders: orderCount.rows[0].count
+        }
+      });
+    } catch (error) {
+      logger.error('Admin delete user error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to delete user'
+      });
+    }
+  }
+
+  /**
+   * Get blockchain monitoring service status
+   * Useful for debugging deposit detection issues
+   */
+  static async getBlockchainMonitorStatus(req, res) {
+    try {
+      const blockchainMonitor = require('../services/BlockchainMonitorService');
+      const DepositAddress = require('../models/DepositAddress');
+
+      // Get monitoring status
+      const status = {
+        is_monitoring: blockchainMonitor.isMonitoring,
+        ethereum: {
+          provider_configured: !!blockchainMonitor.providers.ETH,
+          is_testnet: blockchainMonitor.isTestnet,
+          network_string: blockchainMonitor.getNetworkString(),
+          rpc_url: process.env.ETHEREUM_RPC_URL ? process.env.ETHEREUM_RPC_URL.substring(0, 50) + '...' : 'NOT SET'
+        },
+        deposit_addresses: {}
+      };
+
+      // Get current block if provider exists
+      if (blockchainMonitor.providers.ETH) {
+        try {
+          status.ethereum.current_block = await blockchainMonitor.providers.ETH.getBlockNumber();
+        } catch (error) {
+          status.ethereum.block_error = error.message;
+        }
+      }
+
+      // Count deposit addresses for each currency
+      const currencies = ['ETH', 'USDT', 'USDC', 'BTC', 'LTC'];
+      for (const currency of currencies) {
+        try {
+          const addresses = await DepositAddress.findByCurrency(currency);
+          status.deposit_addresses[currency] = {
+            count: addresses.length,
+            sample: addresses.length > 0 ? addresses[0].address : null
+          };
+        } catch (error) {
+          status.deposit_addresses[currency] = { error: error.message };
+        }
+      }
+
+      res.json({
+        success: true,
+        data: status
+      });
+    } catch (error) {
+      logger.error('Get blockchain monitor status error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get blockchain monitor status'
+      });
+    }
+  }
+}
+
+module.exports = AdminController;
