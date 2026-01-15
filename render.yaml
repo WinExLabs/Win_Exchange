@@ -23,14 +23,14 @@ services:
   - type: redis
     name: cex-redis
     plan: free
-    region: oregon
+    region: frankfurt-postgres
     ipAllowList: []
 
   # Backend API
   - type: web
     name: cex-backend
     env: node
-    region: oregon
+    region: frankfurt-postgres
     plan: free
     buildCommand: cd packages/backend && npm install
     startCommand: cd packages/backend && npm start
