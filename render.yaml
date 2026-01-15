@@ -1,23 +1,23 @@
 services:
-  # PostgreSQL Database
-  - type: pserv
-    name: cex-postgres
-    env: docker
-    plan: free
-    region: oregon
-    dockerfilePath: ./Dockerfile.postgres
-    dockerContext: .
-    envVars:
-      - key: POSTGRES_DB
-        value: cex_db
-      - key: POSTGRES_USER
-        generateValue: true
-      - key: POSTGRES_PASSWORD
-        generateValue: true
-    disk:
-      name: postgres-data
-      mountPath: /var/lib/postgresql/data
-      sizeGB: 1
+  # PostgreSQL Database - Deploy manually via Render dashboard
+  # - type: pserv
+  #   name: cex-postgres
+  #   env: docker
+  #   plan: free
+  #   region: oregon
+  #   dockerfilePath: ./Dockerfile.postgres
+  #   dockerContext: .
+  #   envVars:
+  #     - key: POSTGRES_DB
+  #       value: cex_db
+  #     - key: POSTGRES_USER
+  #       generateValue: true
+  #     - key: POSTGRES_PASSWORD
+  #       generateValue: true
+  #   disk:
+  #     name: postgres-data
+  #     mountPath: /var/lib/postgresql/data
+  #     sizeGB: 1
 
   # Redis Cache
   - type: redis
@@ -36,11 +36,9 @@ services:
     startCommand: cd packages/backend && npm start
     healthCheckPath: /health
     envVars:
-      # Database
+      # Database - Set manually after deploying database
       - key: DATABASE_URL
-        fromDatabase:
-          name: cex-postgres
-          property: connectionString
+        sync: false
 
       # Redis
       - key: REDIS_URL
